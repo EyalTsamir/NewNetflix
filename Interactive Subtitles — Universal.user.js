@@ -721,6 +721,7 @@
   const subtitleHistory = [], sentenceTranslationCache = new Map();
   const sessionGlossary = new Map();
   let subtitleIdCounter = 0, currentSubtitleId = null;
+  let lastHost = null;
 
   function toSentenceCase(text) {
     if (!text || text !== text.toUpperCase()) return text;
@@ -984,6 +985,32 @@
       host.appendChild(gear);
     }
 
+    // כפתור תרגום מהיר
+    let translateBtn = document.getElementById('tm-translate-btn');
+    if (!translateBtn || !host.contains(translateBtn)) {
+      if (translateBtn) translateBtn.remove();
+      translateBtn = document.createElement('div');
+      translateBtn.id = 'tm-translate-btn';
+      translateBtn.textContent = '🌐';
+      Object.assign(translateBtn.style, {
+        position: host === document.body ? 'fixed' : 'absolute',
+        top: '80px', right: '85px', zIndex: '2147483647',
+        width: '56px', height: '56px', borderRadius: '50%',
+        background: 'rgba(30,30,30,0.7)', color: '#fff',
+        fontSize: '32px', lineHeight: '56px', textAlign: 'center',
+        cursor: 'pointer', opacity: '0.6', transition: 'opacity 0.2s, transform 0.3s ease',
+        pointerEvents: 'auto', userSelect: 'none', display: 'none'
+      });
+      translateBtn.onmouseenter = () => { translateBtn.style.opacity = '1'; translateBtn.style.transform = 'scale(1.1)'; };
+      translateBtn.onmouseleave = () => { translateBtn.style.opacity = '0.6'; translateBtn.style.transform = 'scale(1)'; };
+      translateBtn.onclick = () => {
+        if (!currentSubtitleId || !subtitleHistory.length) return;
+        const anchorRect = ensureOverlay().getBoundingClientRect();
+        showSentencePopup(anchorRect);
+      };
+      host.appendChild(translateBtn);
+    }
+
     // פאנל הגדרות
     let panel = document.getElementById('tm-settings-panel');
     if (!panel || !host.contains(panel)) {
@@ -1240,15 +1267,27 @@ Keep it under 600 characters. Write in English. Be factual and concise — this 
       while (padded.length < 9) padded.unshift('');
 
       // --- System prompt: expert audiovisual translator ---
-      let systemPrompt = `You are an expert audiovisual translator specializing in English-to-Hebrew subtitle translation.
+      let systemPrompt = `You are an expert audiovisual translator specializing in English-to-Hebrew subtitle translation for Israeli viewers.
 
 CORE RULES:
 - Use natural spoken Hebrew (עברית מדוברת טבעית) — the way Israelis actually talk, not literary or formal register.
-- Translate MEANING, not word-for-word. Adapt English idioms, slang, and cultural references into natural Hebrew equivalents.
+- NEVER translate literally. Always convey the INTENT and FEELING behind the words. If the original is funny, the translation must be funny. If it's threatening, it must feel threatening in Hebrew.
+- Match the register and tone of the original: slang stays slang, formal stays formal, sarcasm stays sarcastic. A character who says "dude" should sound like "אחי", not "ידידי".
 - Keep translations concise — subtitles must be readable in ~2 seconds. Avoid verbose or overly explanatory phrasing.
 - Infer speaker gender from dialogue cues (names, pronouns, vocatives, context) and apply correct Hebrew verb/adjective conjugation.
 - The 8 history lines (line_1 oldest → line_8 newest) provide narrative context. Use them for pronoun resolution, tone continuity, and consistent terminology. Translate ALL lines, not just the current one.
 - Maintain consistent translation of recurring terms, character names, and domain-specific jargon across all lines.
+
+IDIOMS, SLANG & FIGURATIVE LANGUAGE (CRITICAL):
+When you encounter an English idiom, phrasal verb, slang expression, or figurative phrase — you MUST replace it with a natural Hebrew equivalent that carries the same meaning and feel. NEVER translate idioms word-for-word.
+
+Step-by-step approach for figurative language:
+1. Identify the expression as idiomatic/figurative
+2. Understand the MEANING and EMOTION behind it
+3. Find a Hebrew idiom, expression, or natural phrasing that conveys the same thing
+4. If no perfect Hebrew idiom exists, paraphrase naturally — still NEVER translate literally
+
+Always ask: "Would an Israeli say this?" If not, rephrase.
 
 OUTPUT FORMAT:
 Return STRICT JSON only with these keys:
@@ -1375,14 +1414,22 @@ line_current: ${padded[8]}`;
   }
 
   function tick() {
-    ensureSettingsUI();
+    const host = getHost();
+    if (host !== lastHost) { lastHost = host; ensureSettingsUI(); }
     let raw = '';
     const candidates = document.querySelectorAll('[class*="timedtext"], [class*="subtitle"], [class*="captions"]');
     for (let i = 0; i < candidates.length; i++) {
       const t = candidates[i].innerText.trim();
       if (t.length > 0 && t.length < 240) { raw = t; break; }
     }
-    if (!raw) { ensureOverlay().innerHTML = ''; return; }
+    if (!raw) {
+      if (lastText) { ensureOverlay().innerHTML = ''; lastText = ''; }
+      const tb = document.getElementById('tm-translate-btn');
+      if (tb) tb.style.display = 'none';
+      return;
+    }
+    const tb = document.getElementById('tm-translate-btn');
+    if (tb) tb.style.display = 'block';
     if (raw !== lastText) {
       const normalizedLines = normalizeSubtitleBlock(raw);
       normalizedLines.forEach(line => {
