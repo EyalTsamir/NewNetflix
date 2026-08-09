@@ -1,9 +1,12 @@
 // ==UserScript==
-// @name          Netflix Interactive Subtitles - Suits Edition FIXED 2#
-// @match         *://www.netflix.com/*
+// @name          Netflix Interactive Subtitles
+// @version       2.9
+// @match         *://*.netflix.com/*
+// @match         *://netflix.com/*
 // @run-at        document-idle
 // @connect       api.openai.com
 // @grant         GM_xmlhttpRequest
+// @grant         unsafeWindow
 // ==/UserScript==
 
 (function () {
@@ -17,22 +20,31 @@
   // =========================================================
   // SETTINGS — הגדרות גודל תצוגה (נשמרות ב-localStorage)
   // =========================================================
+  const SCRIPT_VERSION = '2.9';   // מוצג בכותרת פאנל ההגדרות — לזיהוי מהיר שהגרסה שרצה מעודכנת
+  console.log('%c[TM Subtitles] v' + SCRIPT_VERSION + ' loaded', 'color:#e50914;font-weight:bold');
   const SETTINGS_DEFAULTS = {
     overlayFontSize: 3,           // vw — גודל כתוביות (בתוך clamp)
+    overlayBottom: 20,            // % — גובה הכתוביות מתחתית המסך
     wordPopupScale: 1.0,          // מכפיל גודל חלונית מילה (zoom)
     sentencePopupWidth: 980,      // px — רוחב חלונית תרגום
     sentencePopupFontScale: 1.0,  // מכפיל גודל טקסט בחלונית תרגום
-    aiModel: 'gpt-4o',             // מודל AI לתרגום
-    showContext: ''                 // הקשר הסדרה — תיאור חופשי (שם הסדרה, דמויות, ז'אנר)
+    aiModel: 'terra',              // מודל AI לתרגום (ראה MODEL_OPTIONS)
+    showContext: '',                // הקשר הסדרה — תיאור חופשי (שם הסדרה, דמויות, ז'אנר)
+    audioBoost: 1                   // מכפיל עוצמת שמע (1 = ללא הגברה, ראה סעיף AUDIO BOOST)
   };
 
-  const MODEL_PRICES = {
-    'gpt-4o': 10,
-    'gpt-4o-mini': 0.6,
-    'gpt-4.1': 8,
-    'gpt-4.1-mini': 1.6,
-    'gpt-4.1-nano': 0.4
-  };
+  // GPT-5.6 (Sol/Terra/Luna), כל אחד ב-reasoning_effort שנבחר לאיזון שונה של מהירות/אינטליגנציה/מחיר.
+  // price = $ ל-1M טוקן פלט. מקור: Artificial Analysis, אוגוסט 2026.
+  const MODEL_OPTIONS = [
+    { key: 'luna-fast',  model: 'gpt-5.6-luna',  effort: 'none',   label: 'Luna — מהיר', price: 0.24 },
+    { key: 'luna-smart', model: 'gpt-5.6-luna',  effort: 'medium', label: 'Luna — חכם',  price: 0.24 },
+    { key: 'terra',      model: 'gpt-5.6-terra', effort: 'medium', label: 'Terra',        price: 9.6 },
+    { key: 'sol',        model: 'gpt-5.6-sol',   effort: 'low',    label: 'Sol',          price: 30 }
+  ];
+
+  function getModelOption() {
+    return MODEL_OPTIONS.find(o => o.key === settings.aiModel) || MODEL_OPTIONS[2];
+  }
 
   let settings = (() => {
     try {
@@ -49,6 +61,7 @@
       return { ...SETTINGS_DEFAULTS };
     } catch { return { ...SETTINGS_DEFAULTS }; }
   })();
+  if (!MODEL_OPTIONS.some(o => o.key === settings.aiModel)) settings.aiModel = SETTINGS_DEFAULTS.aiModel;
 
   function saveSettings() { localStorage.setItem('tm-subtitle-settings', JSON.stringify(settings)); }
 
@@ -57,6 +70,116 @@
     const min = Math.round(34 * (s / 3));
     const max = Math.round(60 * (s / 3));
     return `clamp(${min}px, ${s}vw, ${max}px)`;
+  }
+
+  // =========================================================
+  // AUDIO BOOST — הגברת עוצמת השמע מעבר ל-100%
+  // video.volume חסום ב-1.0, ולכן הקול מנותב דרך Web Audio:
+  //   source → analyser (גלאי שקט) → gain (ההגברה) → limiter (מונע עיוות) → רמקולים.
+  // כרום מתיר ניתוב אודיו של תוכן מוגן-DRM (רק captureStream נחסם), אבל אם בכל זאת
+  // יוצא שקט — הגלאי מכבה את ההגברה ומבקש רענון, כי חיבור source הוא חד-כיווני
+  // ואי אפשר לנתק אותו מהאלמנט בלי לטעון את הדף מחדש.
+  // =========================================================
+  const AUDIO_MAX_BOOST = 5;
+  let audioCtx = null, audioNodes = null, audioBoostBlocked = false;
+  const audioSourced = new WeakMap();   // <video> שכבר עבר createMediaElementSource — אסור לנסות פעמיים
+  const audioProbe = new Float32Array(512);
+
+  function audioBoostValue() {
+    const v = parseFloat(settings.audioBoost);
+    return isNaN(v) ? 1 : Math.min(AUDIO_MAX_BOOST, Math.max(1, v));
+  }
+
+  // האלמנט שבאמת מנגן. נשארים נעולים עליו עד שהוא יורד מה-DOM, כדי לא לבנות גרף כפול
+  function mainVideoEl() {
+    if (audioNodes && audioNodes.video.isConnected) return audioNodes.video;
+    const vids = Array.from(document.querySelectorAll('video'))
+      .sort((a, b) => b.clientWidth - a.clientWidth);
+    return vids.filter(v => !v.paused)[0] || vids[0] || null;
+  }
+
+  function attachAudioBoost(video) {
+    if (audioSourced.has(video)) return false;
+    if (!audioCtx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) { audioBoostBlocked = true; return false; }
+      audioCtx = new AC();
+    }
+    // הקשר מושהה מנתב את הקול לשומקום — מתחברים רק כשהוא באמת רץ
+    if (audioCtx.state !== 'running') { audioCtx.resume().catch(() => {}); return false; }
+    audioSourced.set(video, true);
+    try {
+      const source = audioCtx.createMediaElementSource(video);
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 512;
+      const gain = audioCtx.createGain();
+      const limiter = audioCtx.createDynamicsCompressor();
+      limiter.threshold.value = -1.5; limiter.knee.value = 0; limiter.ratio.value = 20;
+      limiter.attack.value = 0.003; limiter.release.value = 0.25;
+      // שמירה על ריבוי ערוצים (5.1) במקום דחיסה לסטריאו
+      try { audioCtx.destination.channelCount = audioCtx.destination.maxChannelCount; } catch {}
+      source.connect(analyser); analyser.connect(gain); gain.connect(limiter);
+      limiter.connect(audioCtx.destination);
+      audioNodes = { video, gain, analyser, silentTicks: 0, verified: false };
+      return true;
+    } catch (e) {
+      // InvalidStateError = האלמנט כבר נתפס ע"י AudioContext אחר (תוסף הגברה למשל)
+      audioBoostBlocked = true;
+      console.warn('[TM Subtitles] audio boost unavailable:', e && e.message);
+      return false;
+    }
+  }
+
+  function applyAudioBoost() {
+    const boost = audioBoostValue();
+    if (audioNodes) {
+      audioNodes.gain.gain.setTargetAtTime(boost, audioCtx.currentTime, 0.02);
+      return;
+    }
+    if (boost <= 1 || audioBoostBlocked) return;   // ב-100% לא נוגעים בקול בכלל
+    const video = mainVideoEl();
+    if (video && attachAudioBoost(video)) applyAudioBoost();
+  }
+
+  function verifyAudioBoost() {
+    const n = audioNodes;
+    const v = n && n.video;
+    if (!n || n.verified) return;
+    if (v.paused || v.muted || !v.volume || v.readyState < 3) return;
+    n.analyser.getFloatTimeDomainData(audioProbe);
+    let peak = 0;
+    for (let i = 0; i < audioProbe.length; i++) { const a = Math.abs(audioProbe[i]); if (a > peak) peak = a; }
+    if (peak > 0.0005) { n.verified = true; return; }
+    if (++n.silentTicks < 10) return;   // ~10 שניות של שקט מוחלט תוך כדי נגינה = הדפדפן חסם
+    audioBoostBlocked = true;
+    settings.audioBoost = 1;
+    saveSettings();
+    n.gain.gain.value = 1;
+    updateAudioBoostUI();
+  }
+
+  function syncAudioBoost() {
+    if (audioNodes) {
+      if (!audioNodes.video.isConnected) { audioNodes = null; return; }
+      if (audioCtx.state !== 'running') audioCtx.resume().catch(() => {});
+      verifyAudioBoost();
+      return;
+    }
+    // רק בנגן — כדי לא לתפוס את אלמנט הטריילר שרץ ברקע בדף הבית
+    if (location.pathname.indexOf('/watch') === -1) return;
+    if (audioBoostBlocked || audioBoostValue() <= 1) return;
+    applyAudioBoost();
+  }
+
+  function updateAudioBoostUI() {
+    const panel = document.getElementById('tm-settings-panel');
+    if (!panel) return;
+    const inp = panel.querySelector('input[data-key="audioBoost"]');
+    if (inp) { inp.value = settings.audioBoost; inp.disabled = audioBoostBlocked; }
+    const val = panel.querySelector('.tm-setting-val[data-key="audioBoost"]');
+    if (val) val.textContent = audioBoostValue() + '×';
+    const note = panel.querySelector('#tm-audio-note');
+    if (note) note.style.display = audioBoostBlocked ? 'block' : 'none';
   }
 
   // רשימה סטטית רחבה - תיקון שמות מקומי ללא עלות
@@ -825,7 +948,7 @@
     overlay.id = 'tm-netflix-subtitle-overlay';
     Object.assign(overlay.style, {
       position: host === document.body ? 'fixed' : 'absolute',
-      left: '8%', right: '8%', bottom: '12%', zIndex: '2147483647',
+      left: '8%', right: '8%', bottom: settings.overlayBottom + '%', zIndex: '2147483647',
       textAlign: 'center', fontSize: overlayFontExpr(), lineHeight: '1.25',
       color: '#fff', textShadow: '0 3px 10px rgba(0,0,0,0.95), 0 0 3px rgba(0,0,0,1)',
       fontFamily: 'Arial, sans-serif', fontWeight: '700', pointerEvents: 'auto', whiteSpace: 'pre-line', userSelect: 'none',
@@ -957,12 +1080,164 @@
     `;
   }
 
+  // =========================================================
+  // החלפת שפת כתוביות — אנגלית (ללא CC) ⇄ עברית
+  // =========================================================
+  const SUB_LANGS = {
+    en: { code: 'EN', label: 'אנגלית', prefixes: ['en'], names: ['אנגלית', 'english'] },
+    he: { code: 'עב', label: 'עברית', prefixes: ['he', 'iw'], names: ['עברית', 'hebrew'] }
+  };
+  const CC_PATTERN = /\(cc\)|\[cc\]|\bcc\b|\bsdh\b|תיאור/i;
+
+  let langSwitchBusy = false, lastKnownSubLang = 'en', langTickCounter = 0;
+
+  // ה-API הפנימי של נגן נטפליקס — הדרך הנקייה להחליף רצועה בלי לפתוח תפריט
+  function getNetflixPlayer() {
+    try {
+      const w = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+      const ctx = w.netflix && w.netflix.appContext;
+      if (!ctx) return null;
+      const playerApp = (ctx.state && ctx.state.playerApp) || (ctx.getPlayerApp && ctx.getPlayerApp());
+      const api = playerApp && playerApp.getAPI && playerApp.getAPI();
+      const videoPlayer = api && (api.videoPlayer || (api.getVideoPlayer && api.getVideoPlayer()));
+      if (!videoPlayer || !videoPlayer.getAllPlayerSessionIds) return null;
+      const ids = videoPlayer.getAllPlayerSessionIds() || [];
+      const sid = ids.filter(id => String(id).indexOf('watch') === 0)[0] || ids[ids.length - 1];
+      return sid ? videoPlayer.getVideoPlayerBySessionId(sid) : null;
+    } catch (e) { return null; }
+  }
+
+  function isCCTrack(track) {
+    const type = String(track.trackType || '').toUpperCase();
+    if (type && type !== 'PRIMARY') return true;   // ASSISTIVE / CLOSEDCAPTIONS
+    return CC_PATTERN.test(track.displayName || '');
+  }
+
+  function trackIsLang(track, lang) {
+    const cfg = SUB_LANGS[lang];
+    const bcp = String(track.bcp47 || track.language || '').toLowerCase();
+    if (bcp) return cfg.prefixes.some(p => bcp === p || bcp.indexOf(p + '-') === 0);
+    const name = String(track.displayName || '').toLowerCase();
+    return cfg.names.some(n => name.indexOf(n) === 0);
+  }
+
+  // זיהוי השפה הפעילה: קודם דרך ה-API, אחרת לפי תווים עבריים בכתובית שעל המסך
+  function detectSubLang() {
+    const player = getNetflixPlayer();
+    if (player && player.getTextTrack) {
+      try {
+        const active = player.getTextTrack();
+        if (active && !active.isNoneTrack) {
+          if (trackIsLang(active, 'he')) return 'he';
+          if (trackIsLang(active, 'en')) return 'en';
+        }
+      } catch (e) {}
+    }
+    if (lastText) return /[֐-׿]/.test(lastText) ? 'he' : 'en';
+    return lastKnownSubLang;
+  }
+
+  function setSubLangViaAPI(lang) {
+    const player = getNetflixPlayer();
+    if (!player || !player.getTextTrackList || !player.setTextTrack) return false;
+    try {
+      const list = Array.from(player.getTextTrackList() || []);
+      const usable = list.filter(t => t && !t.isNoneTrack && !t.isForcedNarrative && trackIsLang(t, lang));
+      const track = usable.filter(t => !isCCTrack(t))[0] || usable[0];
+      if (!track) return false;
+      player.setTextTrack(track);
+      return true;
+    } catch (e) { return false; }
+  }
+
+  function subtitleMenuItems() {
+    let list = document.querySelector('.track-list-subtitles');
+    if (!list) {
+      const heading = Array.from(document.querySelectorAll('.track-list-heading, h3'))
+        .filter(h => /כתוביות|subtitles/i.test(h.textContent || ''))[0];
+      list = heading && heading.parentElement;
+    }
+    return list ? Array.from(list.querySelectorAll('li')) : [];
+  }
+
+  function menuItemIsLang(li, lang) {
+    const text = (li.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    if (!text || CC_PATTERN.test(text)) return false;
+    if (/שפת מקור|original/i.test(text)) return false;   // זה פריט של פס הקול, לא של כתוביות
+    return SUB_LANGS[lang].names.some(n => text === n || text.indexOf(n + ' ') === 0);
+  }
+
+  // גיבוי אם ה-API לא זמין — הדמיית לחיצה בתפריט הכתוביות של נטפליקס
+  function setSubLangViaMenu(lang) {
+    return new Promise(resolve => {
+      const opener = document.querySelector('[data-uia="control-audio-subtitle"], [data-uia="control-subtitles"]');
+      if (!opener) return resolve(false);
+      const video = document.querySelector('video');
+      if (video && video.parentElement) video.parentElement.dispatchEvent(new MouseEvent('mousemove', { bubbles: true }));
+      opener.click();
+      let tries = 0;
+      const timer = setInterval(() => {
+        const match = subtitleMenuItems().filter(li => menuItemIsLang(li, lang))[0];
+        if (match) {
+          clearInterval(timer);
+          (match.querySelector('button, [role="menuitem"], [role="menuitemradio"]') || match).click();
+          setTimeout(() => { if (subtitleMenuItems().length) opener.click(); resolve(true); }, 120);
+        } else if (++tries > 20) {
+          clearInterval(timer);
+          if (subtitleMenuItems().length) opener.click();
+          resolve(false);
+        }
+      }, 100);
+    });
+  }
+
+  function toggleSubtitleLang() {
+    if (langSwitchBusy) return;
+    const target = detectSubLang() === 'he' ? 'en' : 'he';
+    langSwitchBusy = true;
+    const done = setSubLangViaAPI(target) ? Promise.resolve(true) : setSubLangViaMenu(target);
+    done.then(ok => {
+      langSwitchBusy = false;
+      if (ok) {
+        lastKnownSubLang = target;
+        // איפוס היסטוריה — כדי שהקשר התרגום לא יערבב שתי שפות
+        subtitleHistory.length = 0;
+        currentSubtitleId = null;
+        lastText = '';
+        const box = document.getElementById('tm-netflix-subtitle-overlay');
+        if (box) box.innerHTML = '';
+      }
+      updateLangButton(ok ? null : 'error');
+    });
+  }
+
+  function updateLangButton(state) {
+    const btn = document.getElementById('tm-lang-toggle');
+    if (!btn) return;
+    if (state === 'error') {
+      btn.textContent = '✕';
+      btn.title = 'לא נמצאה רצועת כתוביות מתאימה';
+      btn.style.background = 'rgba(180,20,20,0.85)';
+      setTimeout(() => { btn.style.background = 'rgba(30,30,30,0.7)'; updateLangButton(); }, 1500);
+      return;
+    }
+    const target = detectSubLang() === 'he' ? 'en' : 'he';
+    btn.textContent = SUB_LANGS[target].code;
+    btn.title = 'החלף כתוביות ל' + SUB_LANGS[target].label + ' (Shift)';
+  }
+
+  // תרגום מהיר — משותף לכפתור 🌐 ולקיצור המקלדת M
+  function triggerQuickTranslate() {
+    if (!currentSubtitleId || !subtitleHistory.length) return;
+    showSentencePopup(ensureOverlay().getBoundingClientRect());
+  }
+
   function ensureSettingsUI() {
     const host = getHost();
 
     // כפתור גלגל שיניים
     let gear = document.getElementById('tm-settings-gear');
-    if (!gear || !host.contains(gear)) {
+    if (!gear || !host.contains(gear) || gear.dataset.tmVersion !== SCRIPT_VERSION) {
       if (gear) gear.remove();
       gear = document.createElement('div');
       gear.id = 'tm-settings-gear';
@@ -982,7 +1257,32 @@
         const p = document.getElementById('tm-settings-panel');
         if (p) { if (p.style.display === 'none') showPopup(p); else hidePopup(p); }
       };
+      gear.dataset.tmVersion = SCRIPT_VERSION;
       host.appendChild(gear);
+    }
+
+    // כפתור החלפת שפת כתוביות — מתחת לגלגל השיניים
+    let langBtn = document.getElementById('tm-lang-toggle');
+    if (!langBtn || !host.contains(langBtn) || langBtn.dataset.tmVersion !== SCRIPT_VERSION) {
+      if (langBtn) langBtn.remove();
+      langBtn = document.createElement('div');
+      langBtn.id = 'tm-lang-toggle';
+      Object.assign(langBtn.style, {
+        position: host === document.body ? 'fixed' : 'absolute',
+        top: '145px', right: '20px', zIndex: '2147483647',
+        width: '56px', height: '56px', borderRadius: '50%',
+        background: 'rgba(30,30,30,0.7)', color: '#fff',
+        fontSize: '20px', fontWeight: 'bold', lineHeight: '56px', textAlign: 'center',
+        cursor: 'pointer', opacity: '0.6', transition: 'opacity 0.2s, transform 0.3s ease, background 0.2s',
+        pointerEvents: 'auto', userSelect: 'none',
+        display: location.pathname.indexOf('/watch') !== -1 ? 'block' : 'none'
+      });
+      langBtn.onmouseenter = () => { langBtn.style.opacity = '1'; langBtn.style.transform = 'scale(1.1)'; };
+      langBtn.onmouseleave = () => { langBtn.style.opacity = '0.6'; langBtn.style.transform = 'scale(1)'; };
+      langBtn.onclick = () => toggleSubtitleLang();
+      langBtn.dataset.tmVersion = SCRIPT_VERSION;
+      host.appendChild(langBtn);
+      updateLangButton();
     }
 
     // כפתור תרגום מהיר
@@ -1003,23 +1303,19 @@
       });
       translateBtn.onmouseenter = () => { translateBtn.style.opacity = '1'; translateBtn.style.transform = 'scale(1.1)'; };
       translateBtn.onmouseleave = () => { translateBtn.style.opacity = '0.6'; translateBtn.style.transform = 'scale(1)'; };
-      translateBtn.onclick = () => {
-        if (!currentSubtitleId || !subtitleHistory.length) return;
-        const anchorRect = ensureOverlay().getBoundingClientRect();
-        showSentencePopup(anchorRect);
-      };
+      translateBtn.onclick = () => triggerQuickTranslate();
       host.appendChild(translateBtn);
     }
 
     // פאנל הגדרות
     let panel = document.getElementById('tm-settings-panel');
-    if (!panel || !host.contains(panel)) {
+    if (!panel || !host.contains(panel) || panel.dataset.tmVersion !== SCRIPT_VERSION) {
       if (panel) panel.remove();
       panel = document.createElement('div');
       panel.id = 'tm-settings-panel';
       Object.assign(panel.style, {
         position: host === document.body ? 'fixed' : 'absolute',
-        top: '145px', right: '20px', zIndex: '2147483647',
+        top: '210px', right: '20px', zIndex: '2147483647',
         width: '320px', padding: '22px', borderRadius: '16px',
         background: 'linear-gradient(180deg, rgba(15,15,20,0.97), rgba(5,5,10,0.97))',
         color: '#fff', boxShadow: '0 15px 50px rgba(0,0,0,0.7)',
@@ -1031,14 +1327,16 @@
 
       const sliders = [
         { label: 'גודל כתוביות', key: 'overlayFontSize', min: 1, max: 6, step: 0.5, suffix: 'vw' },
+        { label: 'גובה כתוביות', key: 'overlayBottom', min: 5, max: 45, step: 1, suffix: '%' },
         { label: 'גודל חלונית מילה', key: 'wordPopupScale', min: 0.5, max: 2, step: 0.1, suffix: '×' },
         { label: 'רוחב חלונית תרגום', key: 'sentencePopupWidth', min: 500, max: 1400, step: 50, suffix: 'px' },
-        { label: 'גודל טקסט תרגום', key: 'sentencePopupFontScale', min: 0.5, max: 2, step: 0.1, suffix: '×' }
+        { label: 'גודל טקסט תרגום', key: 'sentencePopupFontScale', min: 0.5, max: 2, step: 0.1, suffix: '×' },
+        { label: 'הגברת שמע', key: 'audioBoost', min: 1, max: AUDIO_MAX_BOOST, step: 0.1, suffix: '×' }
       ];
 
       let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
         <span style="cursor:pointer;opacity:0.7;font-size:20px;" id="tm-settings-close">×</span>
-        <span style="font-size:18px;font-weight:bold;">⚙ הגדרות תצוגה</span>
+        <span style="font-size:18px;font-weight:bold;">⚙ הגדרות תצוגה <span style="font-size:11px;opacity:0.45;font-weight:normal;">v${SCRIPT_VERSION}</span></span>
       </div>`;
 
       sliders.forEach(s => {
@@ -1054,11 +1352,14 @@
         </div>`;
       });
 
+      // מוצג רק אם הדפדפן חסם את ניתוב האודיו (ראה verifyAudioBoost)
+      html += `<div id="tm-audio-note" style="display:none;margin:-6px 0 14px;padding:8px;border-radius:8px;background:rgba(180,20,20,0.2);border:1px solid rgba(180,20,20,0.5);font-size:12px;line-height:1.5;">הדפדפן חסם את הגברת השמע בתוכן המוגן. רענן את הדף (Ctrl+Shift+R) כדי להחזיר את הקול.</div>`;
+
       // --- בחירת מודל AI ---
       html += `<div style="margin-bottom:14px;">
         <div style="font-size:14px;margin-bottom:4px;text-align:right;">מודל AI</div>
         <select id="tm-ai-model" style="width:100%;padding:8px;border-radius:8px;border:1px solid #444;background:#1a1a1a;color:#fff;font-size:14px;direction:ltr;">
-          ${['gpt-4o','gpt-4o-mini','gpt-4.1','gpt-4.1-mini','gpt-4.1-nano'].map(m => { const price = MODEL_PRICES[m]; const priceStr = price >= 1 ? '$' + price : '$' + price.toFixed(1); return `<option value="${m}"${settings.aiModel===m?' selected':''}>${m} — ${priceStr}/1M</option>`; }).join('')}
+          ${MODEL_OPTIONS.map(o => { const priceStr = o.price >= 1 ? '$' + o.price : '$' + o.price.toFixed(2); return `<option value="${o.key}"${settings.aiModel===o.key?' selected':''}>${o.label} — ${priceStr}/1M</option>`; }).join('')}
         </select>
       </div>`;
 
@@ -1106,10 +1407,14 @@
           if (key === 'overlayFontSize' && overlay) {
             overlay.style.fontSize = overlayFontExpr();
           }
+          if (key === 'overlayBottom' && overlay) {
+            overlay.style.bottom = settings.overlayBottom + '%';
+          }
           if (key === 'sentencePopupWidth') {
             const el = document.getElementById('tm-sentence-popup');
             if (el) el.style.width = `min(${settings.sentencePopupWidth}px, 94vw)`;
           }
+          if (key === 'audioBoost') applyAudioBoost();
         });
       });
 
@@ -1119,7 +1424,10 @@
         settings.showContext = savedContext;
         saveSettings();
         applyDynamicStyles();
-        if (overlay) overlay.style.fontSize = overlayFontExpr();
+        if (overlay) {
+          overlay.style.fontSize = overlayFontExpr();
+          overlay.style.bottom = settings.overlayBottom + '%';
+        }
         const sp = document.getElementById('tm-sentence-popup');
         if (sp) sp.style.width = `min(${settings.sentencePopupWidth}px, 94vw)`;
         panel.querySelectorAll('input[type="range"]').forEach(inp => {
@@ -1130,10 +1438,13 @@
         });
         const modelSel = panel.querySelector('#tm-ai-model');
         if (modelSel) modelSel.value = settings.aiModel;
+        applyAudioBoost();
       };
 
+      panel.dataset.tmVersion = SCRIPT_VERSION;
       host.appendChild(panel);
     }
+    updateAudioBoostUI();
   }
 
   // =========================================================
@@ -1157,7 +1468,7 @@ Keep it under 600 characters. Write in English. Be factual and concise — this 
         method: 'POST', url: 'https://api.openai.com/v1/chat/completions',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${OPENAI_API_KEY}` },
         data: JSON.stringify({
-          model: settings.aiModel, temperature: 0.7,
+          model: getModelOption().model, reasoning_effort: getModelOption().effort,
           messages: [
             { role: 'system', content: systemPrompt },
             { role: 'user', content: showName }
@@ -1321,7 +1632,7 @@ line_current: ${padded[8]}`;
         method: 'POST', url: 'https://api.openai.com/v1/chat/completions',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${OPENAI_API_KEY}` },
         data: JSON.stringify({
-          model: settings.aiModel, temperature: 0.2, response_format: { type: 'json_object' },
+          model: getModelOption().model, reasoning_effort: getModelOption().effort, response_format: { type: 'json_object' },
           messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }]
         }),
         onload: function (r) {
@@ -1416,6 +1727,15 @@ line_current: ${padded[8]}`;
   function tick() {
     const host = getHost();
     if (host !== lastHost) { lastHost = host; ensureSettingsUI(); }
+
+    const langBtn = document.getElementById('tm-lang-toggle');
+    if (langBtn) {
+      const onWatch = location.pathname.indexOf('/watch') !== -1;
+      langBtn.style.display = onWatch ? 'block' : 'none';
+      // רענון התווית פעם בשנייה — כדי לשקף גם החלפה ידנית דרך תפריט נטפליקס
+      if (onWatch && !langSwitchBusy && ++langTickCounter % 10 === 0) updateLangButton();
+    }
+
     let raw = '';
     const candidates = document.querySelectorAll('[class*="timedtext"], [class*="subtitle"], [class*="captions"]');
     for (let i = 0; i < candidates.length; i++) {
@@ -1448,14 +1768,76 @@ line_current: ${padded[8]}`;
   applyDynamicStyles();
   ensureSettingsUI();
 
-  document.addEventListener('keydown', e => {
-    if (e.key === 'Escape') {
-      ['tm-word-popup', 'tm-sentence-popup', 'tm-settings-panel'].forEach(id => {
-        const el = document.getElementById(id);
-        if (el && el.style.display !== 'none') hidePopup(el);
+  // Ensure the script initializes even if DOM is not ready
+  function initializeWhenReady() {
+    if (document.body) {
+      // סגירת חלוניות — משותף למקש Escape ולקיצור N
+      const openPopups = () => ['tm-word-popup', 'tm-sentence-popup', 'tm-settings-panel']
+        .map(id => document.getElementById(id))
+        .filter(el => el && el.style.display !== 'none');
+      const closeOpenPopups = () => openPopups().forEach(hidePopup);
+      document.addEventListener('keydown', e => {
+        if (e.key === 'Escape') closeOpenPopups();
       });
-    }
-  });
 
-  setInterval(tick, 100);
+      // קיצור מקלדת: הקשה בודדת על Shift מחליפה שפת כתוביות.
+      // (Alt לא מתאים — כרום חוטף אותו לשורת התפריטים ואירוע השחרור לא מגיע לדף.)
+      // הפעולה מתבצעת בשחרור המקש, ורק אם Shift נלחץ לבדו — כך Shift+חץ וצירופים אחרים לא מפעילים אותה.
+      let shiftAlone = false;
+      const inEditableField = el => el && /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName || '');
+      window.addEventListener('keydown', e => {
+        if (e.key === 'Shift') {
+          if (e.repeat) return;
+          shiftAlone = !inEditableField(e.target) && location.pathname.indexOf('/watch') !== -1;
+        } else {
+          shiftAlone = false;
+        }
+      }, true);
+      window.addEventListener('keyup', e => {
+        if (e.key !== 'Shift' || !shiftAlone) return;
+        shiftAlone = false;
+        toggleSubtitleLang();
+      }, true);
+      window.addEventListener('mousedown', () => { shiftAlone = false; }, true);
+      window.addEventListener('blur', () => { shiftAlone = false; });
+
+      // קיצורי מקלדת: M מפעיל תרגום AI (זהה ללחיצה על כפתור 🌐), N סוגר חלונית פתוחה.
+      // הבדיקה לפי e.code כדי שיעבוד גם בפריסת מקלדת עברית.
+      // נטפליקס רושמת מאזין keydown משלה עוד לפני שהסקריפט נטען ועלולה לבלוע את האירוע,
+      // ולכן ההפעלה מנוסה גם ב-keyup — אותו שלב שבו קיצור ה-Shift עובד.
+      const isHotkey = (e, code, letter) =>
+        (e.code === code || e.key === letter || e.key === letter.toUpperCase()) &&
+        !e.repeat && !e.ctrlKey && !e.altKey && !e.metaKey &&
+        !inEditableField(e.target) && !(e.target && e.target.isContentEditable) &&
+        location.pathname.indexOf('/watch') !== -1;
+      // N נתפס רק כשיש חלונית פתוחה — אחרת הוא ממשיך לנטפליקס, שמשתמשת בו לפרק הבא
+      const hotkeyAction = e => {
+        if (isHotkey(e, 'KeyM', 'm')) return triggerQuickTranslate;
+        if (isHotkey(e, 'KeyN', 'n') && openPopups().length) return closeOpenPopups;
+        return null;
+      };
+      let hotkeyDownCode = '';
+      window.addEventListener('keydown', e => {
+        const action = hotkeyAction(e);
+        if (!action) return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        hotkeyDownCode = e.code;
+        action();
+      }, true);
+      window.addEventListener('keyup', e => {
+        const action = hotkeyAction(e);
+        if (!action) return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        if (hotkeyDownCode !== e.code) action();
+        hotkeyDownCode = '';
+      }, true);
+      setInterval(tick, 100);
+      setInterval(syncAudioBoost, 1000);
+    } else {
+      setTimeout(initializeWhenReady, 100);
+    }
+  }
+  initializeWhenReady();
 })();
