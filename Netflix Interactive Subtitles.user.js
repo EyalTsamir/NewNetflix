@@ -941,9 +941,20 @@
 
   function getHost() { return document.fullscreenElement || document.body; }
 
+  // הצמדת אלמנט קיים למארח הנוכחי — העברה, לא יצירה מחדש.
+  // קודם נוצר אלמנט חדש בכל מעבר מסך-מלא והישן נשאר תלוי ב-body עם הכתובית האחרונה בתוכו;
+  // הוא כבר לא התעדכן ולא נוקה, ולכן נתקע על המסך ו"נעלם" רק במסך מלא (שם מוצג רק תת-העץ שלו).
+  function attachToHost(el, host) {
+    if (el.parentElement !== host) {
+      el.style.position = host === document.body ? 'fixed' : 'absolute';
+      host.appendChild(el);
+    }
+    return el;
+  }
+
   function ensureOverlay() {
     const host = getHost();
-    if (overlay && host.contains(overlay)) return overlay;
+    if (overlay) return attachToHost(overlay, host);
     overlay = document.createElement('div');
     overlay.id = 'tm-netflix-subtitle-overlay';
     Object.assign(overlay.style, {
@@ -962,7 +973,7 @@
   function ensurePopup(id, width) {
     const host = getHost();
     let el = document.getElementById(id);
-    if (el && host.contains(el)) return el;
+    if (el) return attachToHost(el, host);
     el = document.createElement('div');
     el.id = id;
     Object.assign(el.style, {
@@ -1077,6 +1088,10 @@
       .tm-sentence-history { font-size: ${Math.round(30 * sfs)}px !important; }
       .tm-sentence-current { font-size: ${Math.round(44 * sfs)}px !important; }
       #tm-word-popup { zoom: ${settings.wordPopupScale}; }
+      #tm-settings-panel::-webkit-scrollbar { width: 8px; }
+      #tm-settings-panel::-webkit-scrollbar-track { background: transparent; }
+      #tm-settings-panel::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.22); border-radius: 4px; }
+      #tm-settings-panel::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.4); }
     `;
   }
 
@@ -1317,6 +1332,8 @@
         position: host === document.body ? 'fixed' : 'absolute',
         top: '210px', right: '20px', zIndex: '2147483647',
         width: '320px', padding: '22px', borderRadius: '16px',
+        // תקרת גובה + גלילה — אחרת התחתית של הפאנל נחתכת במסכים נמוכים
+        maxHeight: 'calc(100vh - 230px)', overflowY: 'auto', overscrollBehavior: 'contain',
         background: 'linear-gradient(180deg, rgba(15,15,20,0.97), rgba(5,5,10,0.97))',
         color: '#fff', boxShadow: '0 15px 50px rgba(0,0,0,0.7)',
         border: '1px solid rgba(255,255,255,0.15)',
@@ -1726,7 +1743,8 @@ line_current: ${padded[8]}`;
 
   function tick() {
     const host = getHost();
-    if (host !== lastHost) { lastHost = host; ensureSettingsUI(); }
+    // מעבר מסך-מלא: מעבירים מיד את הכתובית למארח החדש כדי שלא תיעלם עד הכתובית הבאה
+    if (host !== lastHost) { lastHost = host; ensureSettingsUI(); ensureOverlay(); }
 
     const langBtn = document.getElementById('tm-lang-toggle');
     if (langBtn) {
